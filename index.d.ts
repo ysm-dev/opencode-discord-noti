@@ -1,6 +1,6 @@
-import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin"
 
-/** Options in OpenCode v1's [package, options] plugin entry. */
+/** Options in OpenCode v2's { package, options } plugin entry. */
 export interface DiscordNotificationOptions {
   /** Discord webhook URL. Required to send notifications. */
   webhookUrl?: string
@@ -12,8 +12,5 @@ export interface DiscordNotificationOptions {
   avatarUrl?: string
 }
 
-export declare const DiscordNotificationPlugin: (
-  input: PluginInput,
-  options?: DiscordNotificationOptions,
-) => Promise<Hooks>
+export declare const DiscordNotificationPlugin: Plugin.Plugin
 export default DiscordNotificationPlugin
