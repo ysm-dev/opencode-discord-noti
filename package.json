@@ -1,0 +1,60 @@
+{
+  "name": "opencode-discord-noti",
+  "version": "0.2.0",
+  "description": "OpenCode v1 plugin that sends Discord notifications for completed responses, permission requests, and questions.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ysm-dev/opencode-discord-noti.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ysm-dev/opencode-discord-noti/issues"
+  },
+  "homepage": "https://github.com/ysm-dev/opencode-discord-noti#readme",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "discord",
+    "notifications"
+  ],
+  "files": [
+    "dist",
+    "index.d.ts",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm --packages external",
+    "typecheck": "tsgo --noEmit",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "lint": "biome lint --write .",
+    "lint:check": "biome lint .",
+    "knip": "knip",
+    "check": "biome check --write .",
+    "check:ci": "biome check .",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage",
+    "test:package": "node scripts/package-smoke.mjs",
+    "prepare": "bun run build",
+    "prepack": "bun run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.14.0 <2"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.12",
+    "@opencode-ai/plugin": "1.14.28",
+    "@types/node": "^25.6.0",
+    "@typescript/native-preview": "beta",
+    "bun-types": "^1.3.13",
+    "knip": "^6.14.1"
+  }
+}

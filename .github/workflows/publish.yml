@@ -1,0 +1,57 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Check npm version
+        id: pkg
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from "node:fs";
+          const { name, version } = JSON.parse(readFileSync("package.json", "utf8"));
+          const response = await fetch(`https://registry.npmjs.org/${name}/${version}`);
+          if (!response.ok && response.status !== 404) {
+            throw new Error(`npm registry check failed: ${response.status}`);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            `version=${version}\ntag=v${version}\npublished=${response.ok}\n`);
+          NODE
+      - run: bun install --frozen-lockfile
+      - run: bun run check:ci
+      - run: bun run typecheck
+      - run: bun run knip
+      - run: bun run test:coverage
+      - run: bun run test:package
+      - name: Publish to npm using OIDC
+        if: steps.pkg.outputs.published == 'false'
+        run: npm publish --provenance --access public
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.pkg.outputs.tag }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "$RELEASE_TAG" --generate-notes
+          fi

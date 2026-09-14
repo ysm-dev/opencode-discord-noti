@@ -1,0 +1,3 @@
+[test]
+coveragePathIgnorePatterns = ["test/**"]
+coverageSkipTestFiles = true
