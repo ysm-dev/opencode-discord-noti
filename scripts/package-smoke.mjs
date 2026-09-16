@@ -80,7 +80,7 @@ try {
             return [{ id: "assistant", type: "assistant", time: { created: 1, completed: 2 }, model: { id: "test", providerID: "test" }, content: [{ type: "text", text: "Packaged completion" }], tokens }]
           },
         },
-        catalog: { model: { async list() { return { data: [{ id: "test", providerID: "test", limit: { context: 1000 } }] } } } },
+        model: { async list() { return { data: [{ id: "test", providerID: "test", limit: { context: 1000 } }] } } },
         event: { async *subscribe(options) {
           signal = options.signal
           try {

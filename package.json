@@ -1,6 +1,6 @@
 {
   "name": "opencode-discord-noti",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "OpenCode v2 plugin that sends Discord notifications for completed responses, permission requests, and questions.",
   "type": "module",
   "main": "dist/index.js",
@@ -47,7 +47,7 @@
     "prepack": "bun run build"
   },
   "dependencies": {
-    "@opencode/plugin": "2.0.3"
+    "@opencode/plugin": "2.0.4"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.12",

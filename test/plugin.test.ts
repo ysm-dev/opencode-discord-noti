@@ -6,7 +6,7 @@ import plugin, { DiscordNotificationPlugin } from "../src/index"
 type Event = ReturnType<Plugin.Context["event"]["subscribe"]> extends AsyncIterable<infer E> ? E : never
 type Session = Awaited<ReturnType<Plugin.Context["session"]["get"]>>
 type Messages = Awaited<ReturnType<Plugin.Context["session"]["context"]>>
-type Models = Awaited<ReturnType<Plugin.Context["catalog"]["model"]["list"]>>
+type Models = Awaited<ReturnType<Plugin.Context["model"]["list"]>>
 const webhookUrl = "https://discord.invalid/api/webhooks/test/token"
 const config = { enabled: true, webhookUrl, username: "Test Notifier", avatarUrl: "https://example.com/avatar.png" }
 const location = { directory: `${homedir()}/project` }
@@ -122,7 +122,7 @@ function harness(options: Record<string, unknown> = config, owner: Session["loca
     location: owner,
     event: { subscribe },
     session: { get, context },
-    catalog: { model: { list } },
+    model: { list },
   } as unknown as Plugin.Context
   const start = plugin.setup(ctx)
   const cleanup = async () => {
@@ -157,10 +157,7 @@ beforeEach(() => {
     time: { created: 1, updated: 2 },
   }
   messages = []
-  models = {
-    location: { ...location, project: { id: "project-1", directory: location.directory, canonical: "project-1" } },
-    data: [],
-  }
+  models = { location, data: [] }
   fetchSpy = spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }))
 })
 
@@ -256,18 +253,13 @@ describe("v2 notifications", () => {
     expect(payload()).not.toHaveProperty("avatar_url")
   })
 
-  test("filters global events by directory and workspace, resolving unlocated sessions", async () => {
-    const instances = [
-      harness(),
-      harness(config, { directory: "/other" }),
-      harness(config, { ...location, workspaceID: "other" }),
-    ]
+  test("filters global events by directory, resolving unlocated sessions", async () => {
+    const instances = [harness(), harness(config, { directory: "/other" })]
     for (const event of [permission, { ...question, location }]) {
       await Promise.all(instances.map((instance) => instance.send(event)))
     }
     expect(fetchSpy).toHaveBeenCalledTimes(2)
     expect(instances[1]?.get).toHaveBeenCalledTimes(1)
-    expect(instances[2]?.get).toHaveBeenCalledTimes(1)
   })
 
   test("ignores global forms even with question metadata", async () => {
@@ -395,7 +387,7 @@ describe("v2 notifications", () => {
     expect(payload().embeds[0]?.fields).toContainEqual({ name: "📊 Context Usage", value: "N/A", inline: true })
   })
 
-  test("catalog failure does not suppress completion", async () => {
+  test("model list failure does not suppress completion", async () => {
     messages = [
       {
         id: "assistant",

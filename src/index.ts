@@ -129,8 +129,8 @@ async function handleCompletion(ctx: Plugin.Context, config: Config, session: Se
   )
   const tokens = usage?.type === "assistant" ? usage.tokens : undefined
   const model = usage?.type === "assistant" ? usage.model : undefined
-  const models = model ? await ctx.catalog.model.list().catch(() => undefined) : undefined
-  const limit = models?.data.find((item) => item.id === model?.id && item.providerID === model.providerID)?.limit
+  const models = model ? await ctx.model.list().catch(() => undefined) : undefined
+  const limit = models?.data.find((item) => item.id === model?.id && item.providerID === model?.providerID)?.limit
     .context
   const ref = last?.model || session.model
   await post(
@@ -161,7 +161,7 @@ function totalTokens(tokens: Session["tokens"]): number {
 }
 
 function sameLocation(a: Session["location"], b: Session["location"]): boolean {
-  return a.directory === b.directory && a.workspaceID === b.workspaceID
+  return a.directory === b.directory
 }
 
 function sessionFields(session: Session): Field[] {
