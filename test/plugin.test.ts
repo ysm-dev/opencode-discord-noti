@@ -70,17 +70,59 @@ interface Payload {
   username: string
   avatar_url?: string
   allowed_mentions: { parse: string[] }
+  components?: { type: number; components: { type: number; style: number; label: string; url: string }[] }[]
   embeds: {
     title: string
     description: string
     color: number
+    url?: string
     fields: { name: string; value: string; inline: boolean }[]
     footer: { text: string }
   }[]
 }
 
+function webhookURL(index = 0): URL {
+  return new URL(fetchSpy.mock.calls[index]?.[0] as string)
+}
+
+function requestTarget(index = 0): string {
+  const url = webhookURL(index)
+  return `${url.origin}${url.pathname}`
+}
+
 function payload(index = 0): Payload {
   return JSON.parse(String(fetchSpy.mock.calls[index]?.[1]?.body))
+}
+
+// Bun's fetch type carries preconnect(); mock implementations must include it.
+function respond(implementation: (url: URL | RequestInfo, init?: RequestInit) => Promise<Response>) {
+  return Object.assign(implementation, { preconnect: fetch.preconnect })
+}
+
+// Mirrors Discord's accounting: title, description, field names/values, footer, and url all count.
+function fit(body: Payload): number {
+  const embed = body.embeds[0]!
+  return (
+    embed.title.length +
+    embed.description.length +
+    embed.fields.reduce((total, field) => total + field.name.length + field.value.length, 0) +
+    embed.footer.text.length +
+    (embed.url?.length ?? 0)
+  )
+}
+
+function wellFormed(text: string): boolean {
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(index + 1)
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false
+      index += 1
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false
+    }
+  }
+  return true
 }
 
 // Each send resolves when the consumer has finished handling that event.
@@ -178,7 +220,7 @@ describe("v2 notifications", () => {
     await instance.send(permission)
     expect(instance.get).toHaveBeenCalledWith({ sessionID: "session-1" })
     expect(fetchSpy).toHaveBeenCalledTimes(1)
-    expect(fetchSpy.mock.calls[0]?.[0]).toBe(webhookUrl)
+    expect(webhookURL().href).toBe(new URL(webhookUrl).href)
     expect(fetchSpy.mock.calls[0]?.[1]?.method).toBe("POST")
     const body = payload()
     expect(body.username).toBe(config.username)
@@ -244,7 +286,7 @@ describe("v2 notifications", () => {
     const second = harness({ ...config, webhookUrl: "https://discord.invalid/second" })
     await first.send(permission)
     await second.send(permission)
-    expect(fetchSpy.mock.calls.map(([url]) => url)).toEqual([webhookUrl, "https://discord.invalid/second"])
+    expect([requestTarget(0), requestTarget(1)]).toEqual([webhookUrl, "https://discord.invalid/second"])
   })
 
   test("uses default optional settings", async () => {
@@ -278,6 +320,69 @@ describe("v2 notifications", () => {
     expect(payload().embeds[0]?.fields[0]?.value.length).toBe(1024)
   })
 
+  test("truncation never splits a surrogate pair", async () => {
+    // 2 + 747*2 + 1 units lands the 1500-character cut inside a surrogate pair.
+    const description = `ok${"😀".repeat(747)}\uD83D${"x".repeat(4000)}`
+    await harness().send({
+      ...question,
+      data: { form: { ...question.data.form, fields: [{ type: "string", key: "q0", description }] } },
+    })
+    const bounded = payload().embeds[0]!.description
+    expect(bounded.length).toBeLessThanOrEqual(1500)
+    expect(bounded.length).toBeGreaterThan(1400)
+    expect(wellFormed(bounded)).toBe(true)
+  })
+
+  test("keeps the whole embed within Discord's 6000-character budget", async () => {
+    // A long title (1024-capped field) plus a 7000-character response exceed the 6000 total.
+    session.title = "😀".repeat(700)
+    messages = [
+      {
+        id: "assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "test-model", providerID: "test" },
+        time: { created: 1, completed: 2 },
+        tokens,
+        content: [{ type: "text", text: "📝".repeat(3500) }],
+      },
+    ]
+    await harness().send(completed)
+    const embed = payload().embeds[0]!
+    expect(embed.description.length).toBeLessThan(1500)
+    expect(embed.description.length).toBeGreaterThan(1000)
+    expect(wellFormed(embed.description)).toBe(true)
+    expect(embed.fields[0]?.value.length).toBeLessThanOrEqual(1024)
+    expect(fit(payload())).toBeLessThanOrEqual(6000)
+  })
+
+  test.each([
+    "Clyde",
+    "discord bot",
+    "everyone",
+    "h".repeat(90),
+  ])("invalid username %j falls back and does not break webhooks", async (username) => {
+    await harness({ ...config, username }).send(permission)
+    expect(payload().username).toBe("OpenCode Notifier")
+  })
+
+  test("a custom username that follows Discord's rules is kept", async () => {
+    await harness({ ...config, username: "Build Tester" }).send(permission)
+    expect(payload().username).toBe("Build Tester")
+  })
+
+  test("mention content cannot ping through notifications", async () => {
+    session.title = "@everyone @here <@&123456789012345678>"
+    await harness().send(permission)
+    const body = payload()
+    expect(body.allowed_mentions).toEqual({ parse: [] })
+    expect(body.embeds[0]?.fields).toContainEqual({
+      name: "📝 Session",
+      value: "@everyone @here <@&123456789012345678>",
+      inline: true,
+    })
+  })
+
   test("failed lookups are contained and the subscription continues", async () => {
     const instance = harness()
     instance.get.mockRejectedValueOnce(new Error("offline"))
@@ -288,9 +393,8 @@ describe("v2 notifications", () => {
     expect(log).toHaveBeenCalledTimes(1)
   })
 
-  test.each(["network", "http"])("%s failures are contained without logging webhook secrets", async (kind) => {
-    if (kind === "network") fetchSpy.mockRejectedValueOnce(new Error(`Request failed: ${webhookUrl}`))
-    else fetchSpy.mockResolvedValueOnce(new Response("rate limited", { status: 429 }))
+  test("network failures are contained without logging webhook secrets", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error(`Request failed: ${webhookUrl}`))
     const log = spyOn(console, "error").mockImplementation(() => {})
     const instance = harness()
     await instance.send(permission)
@@ -298,6 +402,115 @@ describe("v2 notifications", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2)
     expect(log).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(log.mock.calls)).not.toContain(webhookUrl)
+  })
+
+  test("a rate-limited webhook retries with the advertised delay and recovers", async () => {
+    // A fresh Response per call: a mocked Response body can only be consumed once.
+    fetchSpy.mockImplementationOnce(
+      respond(
+        async () =>
+          new Response(JSON.stringify({ message: "You are being rate limited.", retry_after: 0.01 }), { status: 429 }),
+      ),
+    )
+    const log = spyOn(console, "error").mockImplementation(() => {})
+    await harness().send(permission)
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(payload(1).embeds[0]?.description).toBe("Run a command?")
+    expect(log).not.toHaveBeenCalled()
+  })
+
+  test("a persistent rate limit gives up after the retry budget with a redacted status", async () => {
+    fetchSpy.mockImplementation(
+      respond(
+        async () =>
+          new Response(JSON.stringify({ message: "You are being rate limited.", retry_after: 0 }), { status: 429 }),
+      ),
+    )
+    const log = spyOn(console, "error").mockImplementation(() => {})
+    const instance = harness()
+    await instance.send(permission)
+    await instance.send(question)
+    expect(fetchSpy).toHaveBeenCalledTimes(6)
+    expect(log).toHaveBeenCalledTimes(2)
+    expect(JSON.stringify(log.mock.calls)).not.toContain(webhookUrl)
+  })
+
+  test.each([
+    [403, JSON.stringify({ message: "Invalid Form Body", code: 50035 }), "Invalid Form Body"],
+    [400, JSON.stringify({ message: `webhook ${webhookUrl} is invalid` }), "is invalid"],
+  ])("http %i diagnostics are logged with the body and no webhook URL", async (status, text, expected) => {
+    fetchSpy.mockResolvedValueOnce(new Response(text, { status }))
+    const log = spyOn(console, "error").mockImplementation(() => {})
+    await harness().send(permission)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const logged = JSON.stringify(log.mock.calls)
+    expect(logged).toContain(`DiscordHTTP${status}`)
+    expect(logged).toContain(expected)
+    expect(logged).not.toContain(webhookUrl)
+  })
+
+  test("a non-rate-limit failure is not retried", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("nope", { status: 500 }))
+    const log = spyOn(console, "error").mockImplementation(() => {})
+    await harness().send(permission)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(log).toHaveBeenCalledTimes(1)
+  })
+
+  test("a rate limit without a readable retry_after still recovers using the default delay", async () => {
+    fetchSpy.mockImplementationOnce(respond(async () => new Response("not json", { status: 429 })))
+    // The fallback delay is one second; the assertion is that the retry happens at all.
+    await harness().send(permission)
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(payload(1).embeds[0]?.description).toBe("Run a command?")
+  })
+
+  test("an error body that cannot be read still reports the status", async () => {
+    fetchSpy.mockImplementationOnce(
+      respond(async () => {
+        const response = new Response(null, { status: 502 })
+        Object.defineProperty(response, "text", {
+          value: () => Promise.reject(new Error("stream closed")),
+        })
+        return response
+      }),
+    )
+    const log = spyOn(console, "error").mockImplementation(() => {})
+    await harness().send(permission)
+    expect(JSON.stringify(log.mock.calls)).toContain("DiscordHTTP502")
+    expect(JSON.stringify(log.mock.calls)).not.toContain(webhookUrl)
+  })
+
+  test("an empty error body falls back to the status only", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(null, { status: 401 }))
+    const log = spyOn(console, "error").mockImplementation(() => {})
+    await harness().send(permission)
+    expect(JSON.stringify(log.mock.calls)).toContain("DiscordHTTP401")
+  })
+
+  test("cleanup during a rate-limit retry aborts the retried request", async () => {
+    const retryStarted = Promise.withResolvers<AbortSignal>()
+    fetchSpy
+      .mockImplementationOnce(respond(async () => new Response(JSON.stringify({ retry_after: 0 }), { status: 429 })))
+      .mockImplementationOnce(
+        respond(
+          (_url, init) =>
+            new Promise<Response>((_resolve, reject) => {
+              const signal = init?.signal as AbortSignal
+              retryStarted.resolve(signal)
+              signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+            }),
+        ),
+      )
+    const log = spyOn(console, "error").mockImplementation(() => {})
+    const instance = harness()
+    const sent = instance.send(permission)
+    const signal = await retryStarted.promise
+    const stopped = instance.cleanup()
+    await Promise.all([sent, stopped])
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(signal.aborted).toBe(true)
+    expect(log).not.toHaveBeenCalled()
   })
 
   test("completion includes only final text, native session totals and latest context usage", async () => {
@@ -333,6 +546,53 @@ describe("v2 notifications", () => {
     expect(embed.fields).toContainEqual({ name: "🔢 Session Tokens", value: "1,065 tokens", inline: true })
     expect(embed.fields).toContainEqual({ name: "🤖 Model", value: "test/test-model", inline: true })
     expect(embed.footer.text).toBe("Session ID: session-1")
+  })
+
+  test("webUrl links every notification type to the session in the web app", async () => {
+    const webUrl = "https://opencode.example.com:8443"
+    const base = new URL(webUrl).origin
+    const sessionLink = `${base}/server/${Buffer.from(base).toString("base64url")}/session/session-1`
+    const instance = harness({ ...config, webUrl: `${webUrl}/` })
+    await instance.send(completed)
+    await instance.send(permission)
+    await instance.send(question)
+    expect(fetchSpy).toHaveBeenCalledTimes(3)
+    for (let index = 0; index < 3; index++) {
+      expect(webhookURL(index).searchParams.get("with_components")).toBe("true")
+      const embed = payload(index).embeds[0]!
+      expect(embed.url).toBe(sessionLink)
+      expect(payload(index).components).toEqual([
+        { type: 1, components: [{ type: 2, style: 5, label: "🌐 Open Session", url: sessionLink }] },
+      ])
+      expect(fit(payload(index))).toBeLessThanOrEqual(6000)
+    }
+  })
+
+  test.each([
+    ["https://opencode.example.com:8443", "https://opencode.example.com:8443"],
+    ["opencode.example.com:8443/", "http://opencode.example.com:8443"],
+    ["http://localhost:4096", "http://localhost:4096"],
+  ])("normalizes webUrl %s", async (webUrl, expected) => {
+    await harness({ ...config, webUrl }).send(permission)
+    const embed = payload().embeds[0]!
+    expect(embed.url?.startsWith(`${expected}/server/`)).toBe(true)
+    expect(new URL(embed.url!).pathname.endsWith("/session/session-1")).toBe(true)
+  })
+
+  test("invalid webUrl omits the link and still sends the notification", async () => {
+    const log = spyOn(console, "error").mockImplementation(() => {})
+    await harness({ ...config, webUrl: "http://" }).send(permission)
+    expect(log).toHaveBeenCalledTimes(1)
+    expect(payload().embeds[0]).not.toHaveProperty("url")
+    expect(payload()).not.toHaveProperty("components")
+    expect(webhookURL().searchParams.has("with_components")).toBe(false)
+  })
+
+  test.each([123, false, "  "])("non-string or empty webUrl %j has no link", async (webUrl) => {
+    await harness({ ...config, webUrl }).send(permission)
+    expect(payload().embeds[0]).not.toHaveProperty("url")
+    expect(payload()).not.toHaveProperty("components")
+    expect(webhookURL().searchParams.has("with_components")).toBe(false)
   })
 
   test("subagent idle and completion never notify or fetch message history", async () => {
@@ -435,6 +695,39 @@ describe("v2 notifications", () => {
     expect(signal.aborted).toBe(true)
     expect(instance.closed).toBe(true)
     expect(log).not.toHaveBeenCalled()
+  })
+
+  test("webhook requests keep an existing query string", async () => {
+    const thread = `${webhookUrl}?thread_id=123`
+    await harness({ ...config, webhookUrl: thread, webUrl: "http://localhost:4096" }).send(permission)
+    const url = webhookURL()
+    expect(url.searchParams.get("thread_id")).toBe("123")
+    expect(url.searchParams.get("with_components")).toBe("true")
+  })
+
+  test("a second webhook request does not accumulate with_components params", async () => {
+    const instance = harness({ ...config, webUrl: "http://localhost:4096" })
+    await instance.send(permission)
+    await instance.send(permission)
+    expect(webhookURL(1).searchParams.getAll("with_components")).toEqual(["true"])
+  })
+
+  test.each([
+    // origin 867 -> session url 2062 > 2048: embed link and button both dropped.
+    ["f".repeat(860), false, false],
+    // origin 407 -> session url 936: embed link (2048 max) kept, button (512 max) dropped.
+    ["f".repeat(400), true, false],
+    // origin 107 -> session url 235: link and button both fit.
+    ["f".repeat(100), true, true],
+  ])("long session urls keep the notification: %s", async (host, expectUrl, expectComponents) => {
+    const base = `http://${host}`
+    await harness({ ...config, webUrl: base }).send(permission)
+    const body = payload()
+    const embed = body.embeds[0]!
+    if (expectUrl) expect(embed.url?.startsWith(`${base}/server/`)).toBe(true)
+    else expect(embed).not.toHaveProperty("url")
+    if (expectComponents) expect(body.components?.[0]?.components[0]?.url).toBe(embed.url)
+    else expect(body).not.toHaveProperty("components")
   })
 
   test("webhook requests carry the 10-second timeout", async () => {

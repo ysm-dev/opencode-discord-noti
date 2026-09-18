@@ -1,6 +1,6 @@
 {
   "name": "opencode-discord-noti",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "OpenCode v2 plugin that sends Discord notifications for completed responses, permission requests, and questions.",
   "type": "module",
   "main": "dist/index.js",

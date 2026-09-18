@@ -5,19 +5,44 @@ import type { DiscordNotificationOptions } from "../index"
 type Event = ReturnType<Plugin.Context["event"]["subscribe"]> extends AsyncIterable<infer E> ? E : never
 type Session = Awaited<ReturnType<Plugin.Context["session"]["get"]>>
 type Form = Extract<Event, { type: "form.created" }>["data"]["form"]
-type Config = DiscordNotificationOptions & { webhookUrl: string }
+type Config = DiscordNotificationOptions & { webhookUrl: string; webUrl?: string }
 type Field = { name: string; value: string; inline: boolean }
-type Embed = { title: string; description: string; color: number; fields: Field[] }
+type Embed = { title: string; description: string; color: number; fields: Field[]; url?: string }
+type LinkButton = { type: 2; style: 5; label: string; url: string }
+
+// Error type that always strips the webhook URL (a bundled secret) from its message.
+class RedactedError extends Error {
+  constructor(message: string, webhookUrl: string) {
+    super(message.split(webhookUrl).join("[redacted]"))
+  }
+}
+
+const DEFAULT_USERNAME = "OpenCode Notifier"
+// Discord caps webhook names at 80 characters and rejects reserved or branded names.
+const USERNAME_LIMIT = 80
+const USERNAME_BLOCKLIST = ["clyde", "discord", "everyone", "here"]
+const EMBED_LIMIT = 6000
+const EMBED_URL_LIMIT = 2048
+const BUTTON_URL_LIMIT = 512
 
 export const DiscordNotificationPlugin = Plugin.define({
   id: "opencode-discord-noti",
   setup(ctx) {
     const input = ctx.options
     if (input.enabled !== true || typeof input.webhookUrl !== "string" || !input.webhookUrl.trim()) return
+    let webUrl: string | undefined
+    if (typeof input.webUrl === "string" && input.webUrl.trim()) {
+      try {
+        webUrl = normalizeWebUrl(input.webUrl)
+      } catch {
+        reportError("config", new Error("invalid webUrl"))
+      }
+    }
     const config: Config = {
       webhookUrl: input.webhookUrl.trim(),
-      username: typeof input.username === "string" ? input.username : undefined,
+      username: typeof input.username === "string" ? effectiveUsername(input.username) : undefined,
       avatarUrl: typeof input.avatarUrl === "string" ? input.avatarUrl : undefined,
+      webUrl,
     }
     const controller = new AbortController()
     const task = (async () => {
@@ -58,9 +83,10 @@ async function handleEvent(ctx: Plugin.Context, config: Config, event: Event, si
   if (!event.location && !sameLocation(session.location, ctx.location)) return
   if (signal.aborted) return
 
+  const url = config.webUrl ? sessionUrl(config.webUrl, session.id) : undefined
   if (event.type === "session.execution.succeeded") {
     if (session.parentID !== undefined) return
-    await handleCompletion(ctx, config, session, signal)
+    await handleCompletion(ctx, config, session, signal, url)
     return
   }
   if (event.type === "permission.asked") {
@@ -82,6 +108,7 @@ async function handleEvent(ctx: Plugin.Context, config: Config, event: Event, si
         description: permission.message || "OpenCode is waiting for permission.",
         color: 0xffa500,
         fields,
+        url,
       },
       signal,
     )
@@ -101,12 +128,34 @@ async function handleEvent(ctx: Plugin.Context, config: Config, event: Event, si
         { name: "🛠️ Tool", value: "question", inline: true },
         { name: "🆔 Call ID", value: typeof tool.id === "string" && tool.id ? tool.id : "n/a", inline: true },
       ],
+      url,
     },
     signal,
   )
 }
 
-async function handleCompletion(ctx: Plugin.Context, config: Config, session: Session, signal: AbortSignal) {
+function normalizeWebUrl(input: string): string {
+  const trimmed = input.trim()
+  const withProtocol = /^https?:\/\//.test(trimmed) ? trimmed : `http://${trimmed}`
+  const parsed = new URL(withProtocol)
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("unsupported protocol")
+  if (!parsed.hostname) throw new Error("missing hostname")
+  return parsed.origin
+}
+
+// The web/desktop app keys servers by URL, so the route encodes the same base URL OpenCode normalizes.
+function sessionUrl(base: string, sessionID: string): string {
+  const server = Buffer.from(base).toString("base64url")
+  return `${base}/server/${server}/session/${sessionID}`
+}
+
+async function handleCompletion(
+  ctx: Plugin.Context,
+  config: Config,
+  session: Session,
+  signal: AbortSignal,
+  url?: string,
+) {
   const messages = await ctx.session.context({ sessionID: session.id })
   const assistants = messages
     .filter((message) => message.type === "assistant")
@@ -151,6 +200,7 @@ async function handleCompletion(ctx: Plugin.Context, config: Config, session: Se
         { name: "🔢 Session Tokens", value: `${totalTokens(session.tokens).toLocaleString()} tokens`, inline: true },
         { name: "🤖 Model", value: ref ? `${ref.providerID}/${ref.id}` : "Unknown", inline: true },
       ],
+      url,
     },
     signal,
   )
@@ -181,7 +231,41 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 function trim(text: string, limit: number): string {
-  return text.length > limit ? `${text.substring(0, limit - 3)}...` : text
+  if (text.length <= limit) return text
+  let cut = limit - 3
+  // Never split a surrogate pair; the goal is a well-formed string even at the boundary.
+  if (cut > 0 && isHighSurrogate(text.charCodeAt(cut - 1)) && isLowSurrogate(text.charCodeAt(cut))) cut -= 1
+  return `${text.substring(0, cut)}...`
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff
+}
+
+function effectiveUsername(username: string): string | undefined {
+  const name = username.trim()
+  const blocked = USERNAME_BLOCKLIST.some((word) => name.toLowerCase().includes(word))
+  if (!name || name.length > USERNAME_LIMIT || blocked) return DEFAULT_USERNAME
+  return name
+}
+
+// Discord caps each piece and the combined embed (title, description, field names/values, footer, url) at 6000.
+function fitEmbed(embed: Embed): Embed {
+  const sized = {
+    ...embed,
+    description: trim(embed.description, 1500),
+    fields: embed.fields.map((field) => ({ ...field, value: trim(field.value, 1024) })),
+  }
+  const used =
+    sized.title.length +
+    sized.fields.reduce((total, field) => total + field.name.length + field.value.length, 0) +
+    (sized.url?.length ?? 0)
+  const available = Math.max(0, EMBED_LIMIT - used)
+  return { ...sized, description: trim(sized.description, available) }
 }
 
 function formatQuestion(form: Form): string {
@@ -201,32 +285,110 @@ function formatQuestion(form: Form): string {
 }
 
 function reportError(kind: string, error: unknown) {
-  // Never print a webhook URL/token from a fetch error.
-  console.error(`opencode-discord-noti (${kind}): failed`, error instanceof Error ? error.name : "Error")
+  // Never print a webhook URL/token from a fetch error: diagnostic bodies are redacted before logging.
+  if (error instanceof Error) console.error(`opencode-discord-noti (${kind}): failed [${error.name}] ${error.message}`)
+  else console.error(`opencode-discord-noti (${kind}): failed Error`)
 }
+
+const RETRY_LIMIT = 2
 
 async function post(config: Config, sessionID: string, embed: Embed, signal: AbortSignal) {
   if (signal.aborted) return
-  const response = await fetch(config.webhookUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
-    body: JSON.stringify({
-      username: config.username || "OpenCode Notifier",
-      avatar_url: config.avatarUrl,
-      allowed_mentions: { parse: [] },
-      embeds: [
-        {
-          ...embed,
-          description: trim(embed.description, 1500),
-          fields: embed.fields.map((field) => ({ ...field, value: trim(field.value, 1024) })),
-          footer: { text: trim(`Session ID: ${sessionID}`, 2048) },
-          timestamp: new Date().toISOString(),
-        },
-      ],
-    }),
+  const webhook = new URL(config.webhookUrl)
+  // Discord rejects embed urls over 2048 characters; dropping one is better than dropping the notification.
+  const url = embed.url && embed.url.length <= EMBED_URL_LIMIT ? embed.url : undefined
+  const body: Record<string, unknown> = {
+    username: config.username || DEFAULT_USERNAME,
+    avatar_url: config.avatarUrl,
+    allowed_mentions: { parse: [] },
+    embeds: [
+      {
+        ...fitEmbed({ ...embed, url }),
+        footer: { text: trim(`Session ID: ${sessionID}`, 2048) },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  }
+  if (url) {
+    // Plain incoming webhooks must opt in before Discord keeps non-interactive components.
+    webhook.searchParams.set("with_components", "true")
+    const button = linkButton(url)
+    if (button) body.components = [{ type: 1, components: [button] }]
+  }
+  for (let attempt = 0; ; attempt++) {
+    if (signal.aborted) return
+    let response: Response
+    try {
+      response = await fetch(webhook, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+        body: JSON.stringify(body),
+      })
+    } catch (error) {
+      if (signal.aborted) return
+      const message = error instanceof Error ? error.message : "request failed"
+      const wrapped = new RedactedError(message, config.webhookUrl)
+      wrapped.name = "NetworkError"
+      throw wrapped
+    }
+    if (response.ok) return
+    if (response.status === 429 && attempt < RETRY_LIMIT) {
+      await sleep((await retryDelay(response)) * (attempt + 1), signal)
+      continue
+    }
+    const error = new RedactedError(await diagnostic(response, config.webhookUrl), config.webhookUrl)
+    error.name = `DiscordHTTP${response.status}`
+    throw error
+  }
+}
+
+function linkButton(url: string): LinkButton | undefined {
+  // Discord rejects link buttons whose url exceeds 512 characters.
+  if (url.length > BUTTON_URL_LIMIT) return undefined
+  return { type: 2, style: 5, label: "🌐 Open Session", url }
+}
+
+async function retryDelay(response: Response): Promise<number> {
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch {
+    body = undefined
+  }
+  const retryAfter = record(body).retry_after
+  // Discord reports seconds; cap the wait so a hostile value cannot stall the subscriber.
+  const seconds = typeof retryAfter === "number" && Number.isFinite(retryAfter) ? retryAfter : 1
+  return Math.min(5, Math.max(0, seconds)) * 1000
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms)
+    const abort = () => {
+      clearTimeout(timer)
+      done()
+    }
+    function done() {
+      signal.removeEventListener("abort", abort)
+      resolve()
+    }
+    signal.addEventListener("abort", abort, { once: true })
   })
-  if (!response.ok) throw new Error(`Discord HTTP ${response.status}`)
+}
+
+async function diagnostic(response: Response, webhookUrl: string): Promise<string> {
+  try {
+    const text = trim((await response.text()).trim(), 300)
+    return text ? redact(text, webhookUrl) : "no response body"
+  } catch {
+    return "response body unavailable"
+  }
+}
+
+function redact(text: string, webhookUrl: string): string {
+  return text.replaceAll(webhookUrl, "[redacted]").replaceAll(encodeURI(webhookUrl), "[redacted]")
 }
 
 export default DiscordNotificationPlugin

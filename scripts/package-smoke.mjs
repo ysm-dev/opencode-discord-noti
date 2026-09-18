@@ -54,10 +54,15 @@ try {
     const server = createServer(async (request, response) => {
       const chunks = []
       for await (const chunk of request) chunks.push(chunk)
-      calls.push(JSON.parse(Buffer.concat(chunks).toString()))
+      calls.push({ url: new URL(request.url, "http://127.0.0.1"), body: JSON.parse(Buffer.concat(chunks).toString()) })
       response.writeHead(204).end()
     }).listen(0, "127.0.0.1")
     await once(server, "listening")
+    const base = "http://127.0.0.1:" + server.address().port
+    const sessionHref = (sessionID) => {
+      const prefix = base + "/server/" + Buffer.from(base).toString("base64url") + "/"
+      return { prefix, href: prefix + "session/" + sessionID }
+    }
     const location = { directory: "/package-test" }
     const tokens = { input: 100, output: 20, reasoning: 5, cache: { read: 30, write: 10 } }
     const done = Promise.withResolvers()
@@ -67,7 +72,8 @@ try {
       cleanup = await plugin.default.setup({
         options: {
           enabled: true,
-          webhookUrl: "http://127.0.0.1:" + server.address().port,
+          webhookUrl: base,
+          webUrl: base,
           username: "Package test",
           avatarUrl: "https://example.com/avatar.png",
         },
@@ -94,11 +100,20 @@ try {
       })
       await done.promise
       assert.equal(calls.length, 3)
-      assert.equal(calls[0].username, "Package test")
-      assert.equal(calls[0].avatar_url, "https://example.com/avatar.png")
-      assert.match(calls[1].embeds[0].description, /Does the packaged plugin accept options/)
-      assert.equal(calls[2].embeds[0].description, "Packaged completion")
-      assert.deepEqual(calls[2].embeds[0].fields.find(field => field.name === "📊 Context Usage"), { name: "📊 Context Usage", value: "16.50%", inline: true })
+      assert.equal(calls[0].body.username, "Package test")
+      assert.equal(calls[0].body.avatar_url, "https://example.com/avatar.png")
+      assert.equal(calls[0].url.searchParams.get("with_components"), "true")
+      assert.equal(calls[0].body.embeds[0].url, sessionHref("root").href)
+      assert.deepEqual(calls[0].body.components, [
+        { type: 1, components: [{ type: 2, style: 5, label: "🌐 Open Session", url: sessionHref("root").href }] },
+      ])
+      assert.match(calls[1].body.embeds[0].description, /Does the packaged plugin accept options/)
+      assert.equal(calls[1].body.embeds[0].url, sessionHref("root").href)
+      assert.equal(calls[1].url.searchParams.get("with_components"), "true")
+      assert.equal(calls[2].body.embeds[0].description, "Packaged completion")
+      assert.deepEqual(calls[2].body.embeds[0].fields.find(field => field.name === "📊 Context Usage"), { name: "📊 Context Usage", value: "16.50%", inline: true })
+      assert.equal(calls[2].body.embeds[0].url, sessionHref("root").href)
+      assert.equal(calls[2].url.searchParams.get("with_components"), "true")
     } finally {
       await cleanup?.()
       server.closeAllConnections()
